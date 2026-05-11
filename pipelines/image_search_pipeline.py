@@ -1,71 +1,94 @@
-"""图片搜索流水线。
-
-职责:
-- 维护 4 个图片搜索引擎(Bing / Sogou / DuckDuckGo / YouImages)
-- 30 分钟内同 query 不重复发送同一张图片(dedup 缓存)
-- 找到候选 → 下载 → base64,返回给调用方让它决定如何发送
-"""
+"""图片搜索流水线：百炼 Responses API 文搜图（web_search_image）+ 下载去重。"""
 
 from __future__ import annotations
 
 import asyncio
 import base64
 import logging
-import random
 import time
 from collections import deque
-from typing import TYPE_CHECKING, Literal, Optional
+from typing import Any, Literal, Optional
 
 import aiohttp
 
-from ..search_engines.bing import BingEngine
-from ..search_engines.duckduckgo import DuckDuckGoEngine
-from ..search_engines.sogou import SogouEngine
-from ..search_engines.you import YouImagesEngine
-from .engine_chain import _build_common_cfg, _build_engine_dict
-
-if TYPE_CHECKING:
-    from ..config import EnginesSection, SearchBackendSection
+from .bailian_responses import BailianResponsesClient
+from .image_query_utils import (
+    build_image_query_keywords,
+    image_item_relevance_score,
+    rank_and_filter_image_items,
+)
 
 logger = logging.getLogger(__name__)
 
-# 状态码:plugin handler 据此决定 user-facing 文案
+# 文搜图：百炼返回后至多采纳的候选条数（与历史去重队列尺度相关）
+_MAX_IMAGE_CANDIDATES = 15
+# 单次工具调用最多发送的图片张数（与 Tool 参数 n 上限一致）
+_MAX_IMAGES_PER_REQUEST = 5
+
 ImageSearchStatus = Literal["ok", "no_results", "no_unique", "all_failed"]
+
+ENGINE_LABEL = "dashscope_web_search_image"
+
+
+def _log_image_items_stage(
+    stage: str,
+    query: str,
+    items: list[dict[str, Any]],
+) -> None:
+    """打印每条图片结果，便于对照关键词核查。"""
+    kws = build_image_query_keywords(query)
+    prefix = "[image_search]"
+    if not items:
+        logger.info("%s [%s] query=%r 条目数=0", prefix, stage, query)
+        return
+    logger.info(
+        "%s [%s] query=%r 分词关键词=%r 条目数=%d",
+        prefix,
+        stage,
+        query,
+        kws,
+        len(items),
+    )
+    for i, item in enumerate(items):
+        if not isinstance(item, dict):
+            logger.info("%s [%s] #%d (非 dict,跳过) %r", prefix, stage, i, item)
+            continue
+        img = item.get("image") or ""
+        thumb = item.get("thumbnail") or ""
+        page = item.get("url") or ""
+        title = (item.get("title") or "").replace("\n", " ").strip()
+        source = item.get("source") or ""
+        score = image_item_relevance_score(item, kws) if kws else 0
+        logger.info(
+            "%s [%s] #%d relevance_score=%d image=%s",
+            prefix,
+            stage,
+            i,
+            score,
+            img,
+        )
+        logger.info("%s [%s] #%d thumbnail=%s", prefix, stage, i, thumb)
+        logger.info("%s [%s] #%d page_url=%s", prefix, stage, i, page)
+        logger.info("%s [%s] #%d source=%s title=%s", prefix, stage, i, source, title[:200])
 
 
 class ImageSearchPipeline:
-    """图片搜索流水线"""
+    """文搜图流水线"""
 
     def __init__(
         self,
         *,
-        engines_cfg: "EnginesSection",
-        backend_cfg: "SearchBackendSection",
+        bailian: Optional[BailianResponsesClient],
     ) -> None:
-        self._engines_cfg = engines_cfg
-        self._backend_cfg = backend_cfg
+        self._bailian = bailian
 
-        common = _build_common_cfg(backend_cfg)
-        self.bing = BingEngine(_build_engine_dict("bing", engines_cfg, common))
-        self.sogou = SogouEngine(_build_engine_dict("sogou", engines_cfg, common))
-        self.duckduckgo = DuckDuckGoEngine(_build_engine_dict("duckduckgo", engines_cfg, common))
-        self.you_images = YouImagesEngine(_build_engine_dict("you_images", engines_cfg, common))
-
-        # 30 分钟去重:每个 query 一个 deque,(url, ts)
+        max_results = max(_MAX_IMAGE_CANDIDATES, 0)
         self._image_history: dict[str, deque[tuple[str, float]]] = {}
-        # 单 query 缓存大小:max_results × 3 但下限 30
-        max_results = max(self._backend_cfg.max_results or 0, 0)
         self._image_history_max_size: int = max(30, max_results * 3) if max_results > 0 else 30
         self._image_repeat_window_seconds: int = 30 * 60
-        # 顶层 query 数量上限,防止长期运行下 dict 单调增长(每次清理过期 query 时检查)
         self._max_distinct_queries: int = 200
-        self.last_engine: Optional[str] = None
 
     def _evict_stale_queries(self, now: float) -> None:
-        """清理 30 分钟内零活跃的 query 条目。
-
-        每条 query 的 deque 内是 (url, ts);ts 都早于窗口 → 整条 query 可丢。
-        """
         window = self._image_repeat_window_seconds
         stale = [
             q
@@ -74,7 +97,6 @@ class ImageSearchPipeline:
         ]
         for q in stale:
             self._image_history.pop(q, None)
-        # 顶层兜底:即使没全部过期,如果 query 数超阈值,按最旧 ts 淘汰至阈值
         if len(self._image_history) > self._max_distinct_queries:
             sorted_by_age = sorted(
                 self._image_history.items(),
@@ -83,29 +105,47 @@ class ImageSearchPipeline:
             for q, _ in sorted_by_age[: -self._max_distinct_queries]:
                 self._image_history.pop(q, None)
 
-    async def find_unique_image_b64(
+    async def find_images_b64(
         self,
         query: str,
-    ) -> tuple[ImageSearchStatus, Optional[str], Optional[str]]:
-        """搜索 + 去重 + 下载 + base64。
+        count: int,
+    ) -> tuple[ImageSearchStatus, list[tuple[str, str]]]:
+        """按检索意图文搜图（``query`` 为自然语言或短语均可），下载最多 ``count`` 张（调用方保证 1<=count<=5）。"""
+        if not self._bailian:
+            logger.warning("[image_search] 未配置百炼 API Key，跳过文搜图")
+            return ("no_results", [])
 
-        Args:
-            query: 关键词
+        count = min(_MAX_IMAGES_PER_REQUEST, max(1, int(count)))
 
-        Returns:
-            ``(status, base64, picked_url)``:
+        limit = max(min(_MAX_IMAGE_CANDIDATES, 50), count)
+        # 百炼侧文搜图常见一次返回约 30 张，会拉长 Responses 耗时与 Token；无官方「张数」参数，
+        # 仅在自然语言中约束检索范围，并声明下游只需少量候选（仍可能返回较多，由本地 limit 截断）。
+        user_input = (
+            "请使用文搜图工具，根据下列检索需求在互联网检索相关图片。\n"
+            "检索需求可为完整自然语言（含角色、作品、风格、用途如壁纸/表情包等），不必压缩为几个词。\n"
+            f"检索需求：{query}\n"
+            "以语义相关为准，可包含表情包、同人图、截图等。\n"
+            "\n"
+            "【重要】请尽量只检索少量最相关的图片（建议不超过 10 张）；"
+            f"本插件随后需从中选用最多 {count} 张发送给用户，过多候选会显著拖慢响应。"
+        )
+        logger.info(
+            "[image_search][bailian_try] query=%r max_items=%d want_count=%d",
+            query,
+            limit,
+            count,
+        )
 
-            - ``("ok", "<base64>", "<url>")`` 找到并下载成功
-            - ``("no_results", None, None)`` 所有引擎都没返回结果
-            - ``("no_unique", None, None)`` 所有候选都在 30 分钟内发送过
-            - ``("all_failed", None, None)`` 候选有,但下载全失败
-        """
-        # ---- 1. 引擎链 fallback 搜索 ---- #
-        image_results = await self._search_with_fallback(query)
+        image_results = await self._bailian.web_search_images(user_input)
+        image_results = image_results[:limit]
+
+        _log_image_items_stage("bailian_raw", query, image_results)
+        image_results = rank_and_filter_image_items(image_results, query)
+        _log_image_items_stage("after_rank_filter", query, image_results)
+
         if not image_results:
-            return ("no_results", None, None)
+            return ("no_results", [])
 
-        # ---- 2. 提取 URL + 去重 ---- #
         image_urls: list[str] = []
         seen: set[str] = set()
         for item in image_results:
@@ -114,12 +154,18 @@ class ImageSearchPipeline:
                 continue
             seen.add(url)
             image_urls.append(url)
+
+        logger.info(
+            "[image_search][urls_dedup] query=%r 去重后条数=%d 全部 image URL:\n%s",
+            query,
+            len(image_urls),
+            "\n".join(f"  [{i}] {u}" for i, u in enumerate(image_urls)),
+        )
         if not image_urls:
-            return ("no_results", None, None)
+            return ("no_results", [])
 
         history = self._image_history.get(query)
         if history is None:
-            # 新 query 接入前先清理过期条目,避免长期运行下 dict 单调增长
             self._evict_stale_queries(time.time())
             history = deque(maxlen=self._image_history_max_size)
             self._image_history[query] = history
@@ -131,68 +177,81 @@ class ImageSearchPipeline:
             if now - ts < self._image_repeat_window_seconds
         }
         candidates = [u for u in image_urls if u not in recent_urls]
+        logger.info(
+            "[image_search][candidates] query=%r 排除近30分钟已发后条数=%d URL 列表:\n%s",
+            query,
+            len(candidates),
+            "\n".join(f"  [{i}] {u}" for i, u in enumerate(candidates)),
+        )
         if not candidates:
-            return ("no_unique", None, None)
+            logger.info(
+                "[image_search][candidates] query=%r 无可选 URL recent_urls 条数=%d",
+                query,
+                len(recent_urls),
+            )
+            return ("no_unique", [])
 
-        random.shuffle(candidates)
-
-        # ---- 3. 依次下载 ---- #
+        results: list[tuple[str, str]] = []
         async with aiohttp.ClientSession(trust_env=True) as session:
+            # 并行预取若干候选，缩短 n>1 时总耗时，降低「百炼已返回但下载阶段仍拖满宿主 RPC」的概率。
+            prefetch_limit = min(len(candidates), max(count + 6, count * 2))
+            prefetch_urls = [u for u in candidates[:prefetch_limit] if u]
+
+            async def _fetch_pair(url: str) -> tuple[str, Optional[bytes]]:
+                logger.info("[image_search][download_try] query=%r url=%s", query, url)
+                data = await self._fetch_image(session, url)
+                return url, data
+
+            fetched: dict[str, Optional[bytes]] = {}
+            if prefetch_urls:
+                for url, data in await asyncio.gather(*[_fetch_pair(u) for u in prefetch_urls]):
+                    fetched[url] = data
+
             for url in candidates:
+                if len(results) >= count:
+                    break
                 if not url:
                     continue
-                image_data = await self._fetch_image(session, url)
+                if url not in fetched:
+                    logger.info("[image_search][download_try] query=%r url=%s", query, url)
+                    fetched[url] = await self._fetch_image(session, url)
+                image_data = fetched[url]
                 if image_data:
                     b64 = base64.b64encode(image_data).decode("utf-8")
                     history.append((url, time.time()))
-                    return ("ok", b64, url)
-        return ("all_failed", None, None)
+                    results.append((b64, url))
+                    logger.info(
+                        "[image_search][download_ok] query=%r engine=%s bytes=%d url=%s idx=%d/%d",
+                        query,
+                        ENGINE_LABEL,
+                        len(image_data),
+                        url,
+                        len(results),
+                        count,
+                    )
+                else:
+                    logger.info("[image_search][download_fail] query=%r url=%s", query, url)
 
-    # ------------------------------------------------------------------ #
-    # 内部:多引擎 fallback 搜索
-    # ------------------------------------------------------------------ #
+        if results:
+            return ("ok", results)
 
-    async def _search_with_fallback(self, query: str) -> list[dict[str, str]]:
-        """按 YouImages → Bing → Sogou → DuckDuckGo 顺序尝试。"""
-        engines_cfg = self._engines_cfg
-        num_results = self._backend_cfg.max_results
+        logger.warning(
+            "[image_search][download_all_failed] query=%r 已尝试 %d 个 URL 均失败",
+            query,
+            len(candidates),
+        )
+        return ("all_failed", [])
 
-        engines: list[tuple[str, str, object]] = [
-            ("you_images", "You Images", self.you_images),
-            ("bing", "Bing", self.bing),
-            ("sogou", "搜狗", self.sogou),
-            ("duckduckgo", "DuckDuckGo", self.duckduckgo),
-        ]
-
-        for engine_key, display_name, engine in engines:
-            # 引擎启用检查
-            is_enabled = getattr(engines_cfg, f"{engine_key}_enabled", None)
-            if is_enabled is None:
-                # bing / sogou / duckduckgo 默认启用,you_images 默认禁用
-                is_enabled = engine_key != "you_images"
-            if not is_enabled:
-                logger.info("%s 图片搜索已禁用,跳过", display_name)
-                continue
-
-            # YouImages 还需 API key
-            if engine_key == "you_images" and hasattr(engine, "has_api_keys"):
-                if not engine.has_api_keys():
-                    logger.info("%s 未配置 API key,跳过", display_name)
-                    continue
-
-            try:
-                logger.info("尝试 %s 搜索图片: %s", display_name, query)
-                image_results = await engine.search_images(query, num_results)  # type: ignore[attr-defined]
-                if image_results:
-                    logger.info("%s 图片搜索成功,找到 %d 张", display_name, len(image_results))
-                    self.last_engine = engine_key
-                    return list(image_results)
-                logger.info("%s 未找到结果,尝试下一个", display_name)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("%s 图片搜索失败: %s", display_name, exc)
-                continue
-
-        return []
+    async def find_unique_image_b64(
+        self,
+        query: str,
+    ) -> tuple[ImageSearchStatus, Optional[str], Optional[str]]:
+        """兼容：等价于 ``find_images_b64(query, 1)`` 的首张结果。"""
+        status, pairs = await self.find_images_b64(query, 1)
+        if not pairs:
+            return status, None, None
+        b64, url = pairs[0]
+        return ("ok", b64, url)
 
     @staticmethod
     async def _fetch_image(session: aiohttp.ClientSession, url: str) -> Optional[bytes]:

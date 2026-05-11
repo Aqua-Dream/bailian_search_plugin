@@ -1,13 +1,7 @@
-"""google_search_plugin 主入口
+"""百炼联网搜索插件（bailian_search）主入口
 
-业务逻辑全部抽到 ``pipelines/`` 子模块,本文件只负责装配 + 派发。
-
-提供三个面向 LLM 的组件:
-- ``@Tool("web_search")``             主搜索工具(支持 URL 直访)
-- ``@Tool("abbreviation_translate")`` 缩写翻译(神奇海螺 nbnhhsh)
-- ``@Action("image_search")``         图片搜索(handler 内按配置短路)
-
-外加一个 ``/google_search_status`` 诊断命令。
+联网搜索与文搜图均使用阿里云百炼 Responses API（OpenAI 兼容模式）。
+URL 直访仍为本地抓取 + 宿主 LLM 总结。
 """
 
 from __future__ import annotations
@@ -15,63 +9,99 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
-from maibot_sdk import Action, Command, MaiBotPlugin, Tool
-from maibot_sdk.types import ActivationType, ToolParameterInfo, ToolParamType
+from maibot_sdk import Command, MaiBotPlugin, Tool
+from maibot_sdk.types import ToolParameterInfo, ToolParamType
 
-from .config import GoogleSearchPluginConfig
+from .config import BailianSearchPluginConfig
+from .pipelines.bailian_responses import BailianResponsesClient, resolve_dashscope_api_key
 from .pipelines.content_fetcher import ContentFetcher
-from .pipelines.engine_chain import EngineChain
 from .pipelines.image_search_pipeline import ImageSearchPipeline
 from .pipelines.llm_runner import LLMRunner
 from .pipelines.search_pipeline import SearchPipeline
 from .pipelines.url_pipeline import UrlPipeline, is_url
-from .pipelines.zhihu_extractor import ZhihuExtractor
-from .translators.nbnhhsh import NbnhhshTranslator
+
+# 百炼 Responses HTTP 超时（秒）。宿主对 plugin.invoke_tool 等 RPC 超时默认 60s，
+# 此处须更小并留余量，否则会出现「宿主已超时、插件仍在等百炼 HTTP」。
+_BAILIAN_RESPONSES_TIMEOUT_SECONDS: float = 55.0
 
 
-class GoogleSearchPlugin(MaiBotPlugin):
-    """麦麦联网插件主类"""
+def _strip_tool_string(value: Any) -> str:
+    """将工具入参转为去首尾空白的字符串；``None`` 与非字符串会安全转为字符串再 strip。"""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    return str(value).strip()
 
-    config_model = GoogleSearchPluginConfig
 
-    # 运行时组件:在 on_load / on_config_update 中装配
-    _engine_chain: Optional[EngineChain]
+def _resolve_image_search_intent_text(
+    question: Any,
+    query: Any,
+    kwargs: dict[str, Any],
+) -> str:
+    """解析文搜图意图文本：优先 ``question``（自然语言），其次 ``query``（兼容旧调用）。"""
+    for v in (
+        question,
+        query,
+        kwargs.get("question"),
+        kwargs.get("query"),
+    ):
+        s = _strip_tool_string(v)
+        if s:
+            return s
+    return ""
+
+
+def _parse_image_search_count_n(value: Any) -> tuple[bool, int, str]:
+    """解析文搜图张数 ``n``：合法范围为 1～5。返回 ``(是否合法, n, 错误说明)``。"""
+    if value is None or value == "":
+        return True, 1, ""
+    if isinstance(value, bool):
+        return False, 0, "参数 n 须为 1～5 的整数，不能为布尔值"
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return False, 0, "参数 n 须为 1～5 的整数"
+    if not (1 <= n <= 5):
+        return False, 0, "参数 n 须在 1～5 之间（表示要获取并发送的图片张数）"
+    return True, n, ""
+
+
+class BailianSearchPlugin(MaiBotPlugin):
+    """百炼联网搜索插件主类"""
+
+    config_model = BailianSearchPluginConfig
+
+    _bailian: Optional[BailianResponsesClient]
     _content_fetcher: Optional[ContentFetcher]
     _llm_runner: Optional[LLMRunner]
     _search_pipeline: Optional[SearchPipeline]
     _url_pipeline: Optional[UrlPipeline]
-    _translator: Optional[NbnhhshTranslator]
     _image_pipeline: Optional[ImageSearchPipeline]
 
     def __init__(self) -> None:
         super().__init__()
-        self._engine_chain = None
+        self._bailian = None
         self._content_fetcher = None
         self._llm_runner = None
         self._search_pipeline = None
         self._url_pipeline = None
-        self._translator = None
         self._image_pipeline = None
-
-    # ---------------------------------------------------------------- #
-    # 生命周期
-    # ---------------------------------------------------------------- #
 
     async def on_load(self) -> None:
         self._build_pipelines()
         cfg = self.config
+        has_key = bool(resolve_dashscope_api_key(cfg.bailian.api_key))
         self.ctx.logger.info(
-            "google_search_plugin v%s 已加载 (model=%s, default_engine=%s, "
-            "image_search=%s, translation=%s)",
+            "bailian_search v%s 已加载 (百炼模型=%s, api_key=%s, image_search=%s)",
             cfg.plugin.version,
-            cfg.models.model_name,
-            cfg.search_backend.default_engine,
+            cfg.bailian.responses_model,
+            "已配置" if has_key else "未配置",
             cfg.actions.image_search_enabled,
-            cfg.translation.enabled,
         )
 
     async def on_unload(self) -> None:
-        self.ctx.logger.info("google_search_plugin 已卸载")
+        self.ctx.logger.info("bailian_search 已卸载")
 
     async def on_config_update(
         self,
@@ -79,7 +109,6 @@ class GoogleSearchPlugin(MaiBotPlugin):
         config_data: dict[str, Any],
         version: str,
     ) -> None:
-        """配置热更新:简单粗暴重建所有组件。"""
         del config_data
         self.ctx.logger.info("配置更新事件: scope=%s version=%s,重建 pipelines", scope, version)
         try:
@@ -88,49 +117,35 @@ class GoogleSearchPlugin(MaiBotPlugin):
             self.ctx.logger.error("重建 pipelines 失败: %s", exc, exc_info=True)
 
     def _build_pipelines(self) -> None:
-        """从 self.config 装配所有运行时组件。"""
         cfg = self.config
-        self._engine_chain = EngineChain(cfg.engines, cfg.search_backend)
-        zhihu = ZhihuExtractor(
-            zhihu_cookies=cfg.search_backend.zhihu_cookies,
-            content_timeout=cfg.search_backend.content_timeout,
-            max_content_length=cfg.search_backend.max_content_length,
-            proxy=cfg.search_backend.proxy or "",
-        )
-        self._content_fetcher = ContentFetcher(
-            backend_cfg=cfg.search_backend,
-            engines_cfg=cfg.engines,
-            you_contents=self._engine_chain.you_contents,
-            zhihu_extractor=zhihu,
-        )
+        key = resolve_dashscope_api_key(cfg.bailian.api_key)
+        if key:
+            self._bailian = BailianResponsesClient(
+                api_key=key,
+                base_url=cfg.bailian.base_url.strip(),
+                model=cfg.bailian.responses_model.strip(),
+                timeout_seconds=_BAILIAN_RESPONSES_TIMEOUT_SECONDS,
+            )
+        else:
+            self._bailian = None
+            self.ctx.logger.warning(
+                "百炼 API Key 未配置：联网搜索与文搜图不可用；请填写 [bailian].api_key 或环境变量 DASHSCOPE_API_KEY",
+            )
+
+        self._content_fetcher = ContentFetcher()
         self._llm_runner = LLMRunner(self.ctx, cfg.models)
         self._search_pipeline = SearchPipeline(
             self.ctx,
             models_cfg=cfg.models,
-            backend_cfg=cfg.search_backend,
-            engine_chain=self._engine_chain,
-            content_fetcher=self._content_fetcher,
-            llm_runner=self._llm_runner,
+            bailian=self._bailian,
         )
         self._url_pipeline = UrlPipeline(
             content_fetcher=self._content_fetcher,
             llm_runner=self._llm_runner,
         )
-        # 翻译器(NbnhhshTranslator 接 dict 配置)
-        self._translator = NbnhhshTranslator(
-            {
-                "timeout": cfg.translation.timeout_seconds,
-                "max_retries": cfg.translation.max_retries,
-            }
-        )
-        # 图片搜索 pipeline
-        self._image_pipeline = ImageSearchPipeline(
-            engines_cfg=cfg.engines,
-            backend_cfg=cfg.search_backend,
-        )
+        self._image_pipeline = ImageSearchPipeline(bailian=self._bailian)
 
     async def _resolve_bot_name(self) -> str:
-        """从全局 bot 配置取昵称(失败时兜底 '机器人')。"""
         try:
             value = await self.ctx.config.get("bot.nickname", "")
         except Exception as exc:  # noqa: BLE001
@@ -139,19 +154,14 @@ class GoogleSearchPlugin(MaiBotPlugin):
         return str(value).strip() or "机器人"
 
     def _ensure_pipelines_ready(self) -> bool:
-        """确保 pipelines 已装配;未装配则尝试重建。"""
-        if all(
-            v is not None
-            for v in (
-                self._engine_chain,
-                self._content_fetcher,
-                self._llm_runner,
-                self._search_pipeline,
-                self._url_pipeline,
-                self._translator,
-                self._image_pipeline,
-            )
-        ):
+        required = (
+            self._content_fetcher,
+            self._llm_runner,
+            self._search_pipeline,
+            self._url_pipeline,
+            self._image_pipeline,
+        )
+        if all(v is not None for v in required):
             return True
         self.ctx.logger.warning("pipelines 未就绪,尝试重建")
         try:
@@ -161,39 +171,28 @@ class GoogleSearchPlugin(MaiBotPlugin):
             return False
         return True
 
-    # ---------------------------------------------------------------- #
-    # Tool: web_search
-    # ---------------------------------------------------------------- #
-
     @Tool(
         "web_search",
-        description="谷歌搜索工具。当见到有人发出疑问或者遇到不熟悉的事情时候，直接使用它获得最新知识！",
+        description=(
+            "联网搜索工具（阿里云百炼 web_search）。当用户有疑问、需要时效信息或不确定的事实时调用，"
+            "用简体中文汇总检索结果。"
+            "**注意**：本工具只做文字联网检索。**发图**请改用独立工具 **`bailian_image_agent`**（百炼文搜图智能体），勿用本工具代替。"
+        ),
         parameters=[
             ToolParameterInfo(
                 name="question",
                 param_type=ToolParamType.STRING,
-                description="需要搜索的消息",
+                description="需要检索的问题或主题",
                 required=True,
-            ),
-            ToolParameterInfo(
-                name="tavily_topic",
-                param_type=ToolParamType.STRING,
-                description=(
-                    "可选:Tavily topic 覆写(general/news);留空表示不传 topic。"
-                    "中文场景不建议指定 news,Tavily news 索引偏向英文体育/政治新闻。"
-                ),
-                required=False,
             ),
         ],
     )
     async def handle_web_search(
         self,
         question: str = "",
-        tavily_topic: str = "",
         stream_id: str = "",
         **kwargs: Any,
     ) -> dict[str, str]:
-        """主搜索入口。"""
         del kwargs
 
         question = (question or "").strip()
@@ -202,12 +201,6 @@ class GoogleSearchPlugin(MaiBotPlugin):
 
         if not self._ensure_pipelines_ready():
             return {"name": "web_search", "content": ""}
-
-        # tavily_topic 校验
-        from .tools.rewrite_output import ALLOWED_TAVILY_TOPICS
-
-        normalized_topic = (tavily_topic or "").strip().lower()
-        topic_override = normalized_topic if normalized_topic in ALLOWED_TAVILY_TOPICS else None
 
         bot_name = await self._resolve_bot_name()
 
@@ -219,110 +212,70 @@ class GoogleSearchPlugin(MaiBotPlugin):
                     bot_name=bot_name,
                 )
             else:
-                self.ctx.logger.info("开始执行搜索,原始问题: %s", question)
+                self.ctx.logger.info("百炼联网搜索,原始问题: %s", question)
                 content = await self._search_pipeline.run(  # type: ignore[union-attr]
                     question,
                     chat_id=stream_id,
                     bot_name=bot_name,
-                    tavily_topic_override=topic_override,
                 )
             return {"name": "web_search", "content": content}
         except Exception as exc:  # noqa: BLE001
             self.ctx.logger.error("web_search 执行异常: %s", exc, exc_info=True)
             return {"name": "web_search", "content": ""}
 
-    # ---------------------------------------------------------------- #
-    # Tool: abbreviation_translate
-    # ---------------------------------------------------------------- #
-
     @Tool(
-        "abbreviation_translate",
+        "bailian_image_agent",
         description=(
-            "当遇到用户消息中出现难懂的网络用语、缩写、黑话、热词或流行语时，"
-            "主动查询并翻译这些词汇以帮助理解。适用于各种类型的网络语言，"
-            "包括字母缩写（如yyds、u1s1）、网络黑话、当下热词、流行语等。"
-            "应该识别消息中可能让人困惑的网络用语并自动查询其含义。"
+            "百炼「文搜图」智能体（百炼 `web_search_image`）：联网按你的描述找图、筛选并**直接发图**给用户，"
+            "不是单纯返回一段文字说明。**被调用即会**走完整文搜图链路，无额外确认参数。"
+            "适合对话已自然聊到「想看 / 要找 / 发一张和某话题相关的图」——例如角色立绘、壁纸、梗图、配图等。"
+            "用参数 question 写清意图：优先一两句完整自然语言（含角色、作品、风格、用途与尺度边界等），"
+            "避免只堆几个空格隔开的名词。"
+            "文搜图链路偏慢，宿主侧单次工具 RPC 默认约 60 秒量级上限；普通闲聊或纯文字问答请不要选用本工具。"
         ),
         parameters=[
             ToolParameterInfo(
-                name="term",
+                name="question",
                 param_type=ToolParamType.STRING,
-                description="从用户消息中识别出的网络用语、缩写或热词（如：yyds、躺平、内卷等）",
-                required=True,
+                description=(
+                    "搜图意图的自然语言描述：可直接沿用用户原话或你理解后的完整表述（不必压缩成关键词），"
+                    "以便保留风格、用途、作品与角色名等语义。"
+                ),
+                required=False,
+                default="",
             ),
             ToolParameterInfo(
-                name="max_results",
-                param_type=ToolParamType.INTEGER,
-                description="返回翻译结果数量,默认 3",
+                name="query",
+                param_type=ToolParamType.STRING,
+                description="兼容旧版调用：图片相关检索短语；若已传 ``question`` 可留空。与 ``question`` 至少填其一。",
                 required=False,
+                default="",
             ),
-        ],
-    )
-    async def handle_abbreviation_translate(
-        self,
-        term: str = "",
-        max_results: int = 3,
-        stream_id: str = "",
-        **kwargs: Any,
-    ) -> dict[str, str]:
-        """缩写翻译入口(走 nbnhhsh 神奇海螺 API)。"""
-        del kwargs
-        del stream_id  # 翻译结果通过 return content 返回给 LLM,不直接 send
-
-        if not self.config.translation.enabled:
-            return {"name": "abbreviation_translate", "content": "翻译功能已禁用"}
-
-        term = (term or "").strip()
-        if not term:
-            return {"name": "abbreviation_translate", "content": "未提供要翻译的词汇"}
-
-        if not self._ensure_pipelines_ready():
-            return {"name": "abbreviation_translate", "content": "翻译组件未就绪"}
-
-        try:
-            self.ctx.logger.info("翻译: %s", term)
-            result = await self._translator.translate(term)  # type: ignore[union-attr]
-        except Exception as exc:  # noqa: BLE001
-            self.ctx.logger.error("翻译异常: %s", exc, exc_info=True)
-            return {"name": "abbreviation_translate", "content": f"缩写翻译失败: {exc}"}
-
-        translations = result.translations[:max_results] if result.translations else []
-        if not translations:
-            return {"name": "abbreviation_translate", "content": f"未找到「{term}」的翻译结果"}
-
-        if len(translations) == 1:
-            content = f"网络用语「{term}」的含义是：{translations[0]}"
-        else:
-            lines = "\n".join(f"• {t}" for t in translations)
-            content = f"网络用语「{term}」的可能含义：\n{lines}"
-        return {"name": "abbreviation_translate", "content": content}
-
-    # ---------------------------------------------------------------- #
-    # Action: image_search
-    # ---------------------------------------------------------------- #
-
-    @Action(
-        "image_search",
-        description="当用户明确需要搜索图片时使用此动作。例如：'搜索一下猫的图片'、'来张风景图'。",
-        activation_type=ActivationType.ALWAYS,
-        action_parameters={"query": "需要搜索的图片关键词"},
-        action_require=[
-            "当用户明确表示想看、想搜索或想要一张图片时使用。",
-            "适用于'搜/找/来一张/发一张xx的图片'等指令。",
-            "如果用户只是在普通聊天中提到了某个事物，不代表他想要图片，此时不应使用。",
-            "一次只随机发送一张图片，30 分钟内不重复发送同一图片。",
-            "若插件配置中未启用图片搜索功能，本动作会拒绝执行,请勿调用。",
+            ToolParameterInfo(
+                name="n",
+                param_type=ToolParamType.INTEGER,
+                description=(
+                    "要获取并发送的图片张数，须为 1～5。"
+                    "宿主对单次工具 RPC 默认约 60s：百炼文搜图本身仍偏慢，`n>1` 时仍可能逼近上限。"
+                    "超时后 Planner 常以为失败而重试或多轮 reply，用户侧可能看到重复话术；非必要请用 `n=1`。"
+                    "多图时插件会并行下载候选、再依次发图。"
+                ),
+                required=False,
+                default=1,
+            ),
         ],
         associated_types=["image"],
         parallel_action=False,
     )
     async def handle_image_search(
         self,
+        question: str = "",
         query: str = "",
+        n: Any = 1,
         stream_id: str = "",
         **kwargs: Any,
     ) -> tuple[bool, str]:
-        """图片搜索入口。未启用时不做条件注册,而是 handler 内短路。"""
+        intent_text = _resolve_image_search_intent_text(question, query, kwargs)
         del kwargs
 
         if not self.config.actions.image_search_enabled:
@@ -333,19 +286,23 @@ class GoogleSearchPlugin(MaiBotPlugin):
                 )
             return False, "图片搜索功能未启用"
 
-        query = (query or "").strip()
-        if not query:
+        if not intent_text:
             if stream_id:
                 await self.ctx.send.text("你想搜什么图片呀？", stream_id)
-            return False, "关键词为空"
+            return False, "搜图内容为空：请传入 question（自然语言，推荐）或 query（兼容）"
+
+        ok_n, want_n, n_err = _parse_image_search_count_n(n)
+        if not ok_n:
+            return False, n_err
 
         if not self._ensure_pipelines_ready():
             return False, "图片搜索组件未就绪"
 
         try:
-            self.ctx.logger.info("开始图片搜索: %s", query)
-            status, b64, url = await self._image_pipeline.find_unique_image_b64(  # type: ignore[union-attr]
-                query
+            self.ctx.logger.info("开始文搜图: %s want_n=%d", intent_text, want_n)
+            status, pairs = await self._image_pipeline.find_images_b64(  # type: ignore[union-attr]
+                intent_text,
+                want_n,
             )
         except Exception as exc:  # noqa: BLE001
             self.ctx.logger.error("图片搜索动作异常: %s", exc, exc_info=True)
@@ -354,20 +311,27 @@ class GoogleSearchPlugin(MaiBotPlugin):
             return False, f"图片搜索失败: {exc}"
 
         if status == "ok":
+            sent = 0
             try:
-                await self.ctx.send.image(b64, stream_id)
-                self.ctx.logger.info("成功发送图片 url=%s", url)
-                return True, "图片发送成功"
+                for b64, url in pairs:
+                    await self.ctx.send.image(b64, stream_id)
+                    sent += 1
+                    self.ctx.logger.info("成功发送图片 %d/%d url=%s", sent, len(pairs), url)
+                msg = f"已发送 {len(pairs)} 张图片"
+                if len(pairs) < want_n:
+                    msg += f"（请求 {want_n} 张，其余候选不足或下载失败）"
+                return True, msg
             except Exception as exc:  # noqa: BLE001
                 self.ctx.logger.error("send.image 失败: %s", exc, exc_info=True)
                 if stream_id:
                     await self.ctx.send.text("我下载好了图片，但是发送失败了...", stream_id)
-                return False, f"发送图片失败: {exc}"
+                detail = f"已发送 {sent} 张后失败" if sent else "发送图片失败"
+                return False, f"{detail}: {exc}"
 
+        # 不在此处 send.text：MaiSaka Planner 可能在多轮中多次调用本工具并更换关键词，
+        # 每条失败都发消息会导致用户连续收到多条「没找到图片」。结论交给 Planner 汇总为一条回复即可。
         if status == "no_results":
-            if stream_id:
-                await self.ctx.send.text(f"我没找到关于「{query}」的图片呢。", stream_id)
-            return False, "未找到图片"
+            return False, f"未找到与「{intent_text}」相关的图片（文搜图无可用结果）"
 
         if status == "no_unique":
             if stream_id:
@@ -377,19 +341,14 @@ class GoogleSearchPlugin(MaiBotPlugin):
                 )
             return False, "30 分钟内图片重复"
 
-        # all_failed
         if stream_id:
             await self.ctx.send.text("找到了图片，但下载都失败了，可能是网络问题。", stream_id)
         return False, "所有图片下载失败"
 
-    # ---------------------------------------------------------------- #
-    # 诊断命令
-    # ---------------------------------------------------------------- #
-
     @Command(
-        "google_search_status",
-        description="查询 google_search_plugin 当前加载状态与关键配置",
-        pattern=r"^/google_search_status\s*$",
+        "bailian_search_status",
+        description="查询百炼联网搜索插件当前加载状态与关键配置",
+        pattern=r"^/bailian_search_status\s*$",
     )
     async def handle_status(
         self,
@@ -399,43 +358,25 @@ class GoogleSearchPlugin(MaiBotPlugin):
         del kwargs
 
         cfg = self.config
-        e = cfg.engines
-        enabled_engines = []
-        if e.google_enabled:
-            enabled_engines.append("google")
-        if e.bing_enabled:
-            enabled_engines.append("bing")
-        if e.sogou_enabled:
-            enabled_engines.append("sogou")
-        if e.duckduckgo_enabled:
-            enabled_engines.append("duckduckgo")
-        if e.tavily_enabled:
-            enabled_engines.append("tavily")
-        if e.you_enabled:
-            enabled_engines.append("you")
-        if e.you_news_enabled:
-            enabled_engines.append("you_news")
+        has_key = bool(resolve_dashscope_api_key(cfg.bailian.api_key))
 
         ready = all(
             v is not None
             for v in (
-                self._engine_chain,
                 self._content_fetcher,
                 self._llm_runner,
                 self._search_pipeline,
                 self._url_pipeline,
-                self._translator,
                 self._image_pipeline,
             )
         )
 
         lines = [
-            f"google_search_plugin v{cfg.plugin.version}",
-            f"模型 task: {cfg.models.model_name}  温度: {cfg.models.temperature}",
-            f"默认引擎: {cfg.search_backend.default_engine}",
-            f"启用引擎: {', '.join(enabled_engines) if enabled_engines else '(无)'}",
+            f"百炼联网搜索插件 (bailian_search) v{cfg.plugin.version}",
+            f"百炼模型: {cfg.bailian.responses_model}",
+            f"百炼 API Key: {'已配置' if has_key else '未配置'}",
+            f"宿主 LLM task: {cfg.models.model_name}（URL 总结）",
             f"图片搜索: {'已启用' if cfg.actions.image_search_enabled else '未启用'}",
-            f"缩写翻译: {'已启用' if cfg.translation.enabled else '未启用'}",
             f"组件就绪: {'是' if ready else '否'}",
         ]
         message = "\n".join(lines)
@@ -445,9 +386,8 @@ class GoogleSearchPlugin(MaiBotPlugin):
         return True, message, True
 
 
-def create_plugin() -> GoogleSearchPlugin:
-    """Runner 通过此工厂函数实例化插件"""
-    return GoogleSearchPlugin()
+def create_plugin() -> BailianSearchPlugin:
+    return BailianSearchPlugin()
 
 
 _logger = logging.getLogger(__name__)
