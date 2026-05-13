@@ -16,30 +16,18 @@
 
 自 **5.1.0** 起，文搜图对外工具名由 `image_search` 改为 **`bailian_image_agent`**。若 MaiSaka / Planner 的固定提示词或规则里仍写旧名，需改为新名并重载插件。
 
-- **`web_search`**：仅用于**文字**联网检索。描述中已提示：**不要用本工具代替发图**；发图应使用 **`bailian_image_agent`**（百炼文搜图智能体）。误用文搜图易导致单次耗时长、触发宿主对插件 RPC 超时（本仓库核心默认 **约 60 秒**，**不在** `bot_config.toml` 中配置，需改宿主源码或后续版本暴露配置）。
-- **`bailian_image_agent`**：**一旦调用即会**请求百炼文搜图并发图（无额外布尔门闩）；误调仍可能白等或触发宿主约 **60s** RPC 超时，请只在确实要发图时使用。
-  - 参数 **`question`（字符串，推荐）**：用**自然语言**描述搜图意图（可含用户原话、风格、用途等），**不必**刻意压成关键词；与 **`query`** 至少填其一。
-  - 参数 **`query`（字符串，可选）**：兼容旧调用；仅有关键词短语时也可只用本字段。
-  - 参数 **`n`（整数，可选，默认 1）**：要获取并发送的图片张数，**须为 1～5**。插件会**并行下载**多张候选，再**依次** `send.image`；张数越多仍越容易逼近宿主 **60s** RPC 上限，**非必要请保持 `n=1`**。
+- **`web_search`**：仅用于**文字**联网检索。描述中已提示：**不要用本工具代替发图**；发图应使用 **`bailian_image_agent`**（百炼文搜图智能体）。误用文搜图会明显拉长单次工具耗时。
+- **`bailian_image_agent`**：**一旦调用即会**请求百炼文搜图并发图（无额外布尔门闩）；请只在确实要发图时使用。
+  - 参数 **`question`（字符串，推荐）**：**宜短**；优先用户原话，名称可能歧义时补最少作品名/领域（如「原神 千织 表情包」）。与 **`query`** 至少填其一。
+  - 参数 **`query`（字符串，可选）**：兼容旧调用；简短检索短语。与 `question` 至少填其一。
+  - 参数 **`n`（整数，可选，默认 1）**：要获取并发送的图片张数，**须为 1～5**。插件会**并行下载**多张候选，再**依次** `send.image`；张数越多总耗时越长，**非必要请保持 `n=1`**。
   - 当对话已经自然落在「想看图 / 讨图 / 要配图」时，传入 **`question`**（或 `query`）；若对方随口说要多张（如「来三张」），将 `n` 设为对应张数（不超过 5）。
 - **`[actions].image_search_enabled = false`**：调用 `bailian_image_agent` 会立即失败（不访问百炼）。工具条目仍可能出现在 Planner 的工具列表中（插件无法在**不重载插件**的前提下从 schema 里动态「删除」该工具）；主 Agent 应**不要**再调用它。若你希望「关闭时列表里完全没有 `bailian_image_agent`」，需要宿主支持按配置过滤工具，或接受重载插件/重启进程。
 
-## 文搜图与超时（为何容易超时）
+## 文搜图行为说明
 
-- **文搜图 `bailian_image_agent`** 会走百炼 `web_search_image`，官方示例里单次常返回约 **30** 张候选，模型侧还要整理输出，整体耗时常 **明显长于** 纯文字联网检索。
-- **宿主 RPC 上限**：MaiSaka / Planner 调用插件工具时，本仓库核心对单次 RPC 等待默认 **约 60 秒**（`60000` ms，见 `component_query._DEFAULT_PLUGIN_COMPONENT_RPC_TIMEOUT_MS` 及 `supervisor.invoke_plugin` 等默认参数）。文搜图极慢时仍可能出现 **`E_TIMEOUT`**，与插件内百炼 HTTP 超时（本插件约 **55s**，须小于宿主 RPC）是两层不同限制。
-- **插件侧**：文搜图与文字搜索已拆成两个工具，由 Planner 选用；若 60s 仍不够，可继续 **改大** 上述常量/默认 `timeout_ms`（仍不在 `bot_config.toml`）。
-- **超时与「重复回复」**：宿主在 RPC 上限到达后放弃等待时，**Runner 侧不一定会取消**正在执行的插件协程（见 `runner_main._handle_invoke` 直接 `await` 工具）。若某次调用已超过上限才返回，Planner 往往已收到 **`E_TIMEOUT`**，可能**再开一轮**并调用 `reply`，于是用户会看到**相近话术发两遍**——这主要来自 **MaiSaka 多轮规划**，不是插件故意双发。减轻办法：必要时再拉长 RPC、`bailian_image_agent` 首次尽量 **`n=1`**、避免首轮用过长 `question`。
-
-### 在宿主（MaiBot）源码里修改插件调用超时
-
-当前版本**未**把该超时暴露到 `bot_config.toml`。本仓库已将插件组件 RPC 默认改为 **60s**；若你使用其他发行版或需更长等待，可自行调整：
-
-1. **`src/plugin_runtime/component_query.py`**：常量 **`_DEFAULT_PLUGIN_COMPONENT_RPC_TIMEOUT_MS`**（工具 / Action / Command 桥接）。
-2. **`src/plugin_runtime/host/supervisor.py`**：`invoke_plugin`、`invoke_message_gateway`、`invoke_llm_provider`、`invoke_api` 的 **`timeout_ms` 默认值**。
-3. **`host/rpc_server.py`、`runner/rpc_client.py`、`protocol/envelope.py`、`integration.py`、`capabilities/components.py`** 等与 RPC 信封/客户端默认超时相关的位置。
-
-**与插件 HTTP 超时的关系**：拉长宿主 RPC 后，请同步调大插件内 `plugin.py` 中的 **`_BAILIAN_RESPONSES_TIMEOUT_SECONDS`**（须 **小于** 宿主 RPC，留几秒余量），否则会出现「宿主还在等、插件 HTTP 已先断」。
+- **文搜图 `bailian_image_agent`** 走百炼 `web_search_image`；官方示例里单次常返回较多候选图。插件对 Responses **默认使用流式**：在 SSE 中解析出文搜图工具返回的图片列表后，**集齐前若干条（至少 5 条或不少于本次要发的张数 `n`）即结束 HTTP**，不再等待模型后续说明文字，以加快返回；若流式不可用则自动回退非流式。
+- 文搜图与文字搜索已拆成两个工具，由 Planner 按需选用。
 
 ## 前置条件
 
@@ -77,21 +65,19 @@ pip install -r requirements.txt -i https://mirrors.aliyun.com/pypi/simple
 - `base_url`：OpenAI 兼容网关，默认 `https://dashscope.aliyuncs.com/compatible-mode/v1`。
 - `responses_model`：Responses 模型名，须支持 `web_search` 与 `web_search_image`。
 
-百炼单次 HTTP 超时在代码中固定为约 **55 秒**（须小于宿主对插件 RPC 的默认 **约 60 秒**），避免「宿主已超时、插件仍在等百炼」。
-
-**耗时与超时**：文搜图在官方示例里常见一次返回约 **30** 张图，耗时与 Token 都偏大；插件在发往百炼的提示词中会软性要求少张，但**无官方张数开关**。联网搜索侧会对拉取的群内上下文做 **约 6000 字截断**。若仍经常超时，可继续在**宿主侧**加大插件 RPC 超时（本仓库默认已为 **60s**），或换用文档推荐的 **Plus** 系模型、减少 `[models]` 中 `context_max_limit` / `context_time_gap`。
+文搜图在官方示例里常见一次返回较多张图；插件在发往百炼的提示词中会软性要求少张，但**无官方张数开关**。联网搜索侧会对拉取的群内上下文做 **约 6000 字截断**。
 
 ### `[models]`（仅 URL 直访总结）
 
 - `model_name`：宿主侧 task，可选 `replyer`、`utils`、`planner`、`vlm`。仅用于 **用户输入为 URL** 时的页面摘要，**不**用于百炼联网正文。
 - `temperature`、`context_time_gap`、`context_max_limit`：与宿主 LLM 调用相关。
-- `llm_timeout_seconds`：单次宿主 LLM 超时（秒）。
+- `llm_timeout_seconds`：单次宿主 LLM 调用上限（秒）。
 
 ### `[actions]`
 
 - `image_search_enabled`：为 **true** 时才允许 `bailian_image_agent` 真正访问百炼；为 **false** 时调用立即失败。不影响 `web_search`。
 
-**说明**：URL 直访抓取与文搜图候选条数等由插件内置固定策略（如单页抓取超时 10s、正文上限约 3000 字、文搜图候选至多 15 条），不再提供 `[search_backend]` 等配置项。
+**说明**：URL 直访抓取与文搜图候选条数等由插件内置固定策略（如单页抓取最长约 10 秒、正文上限约 3000 字、文搜图候选至多 15 条），不再提供 `[search_backend]` 等配置项。
 
 ## 使用与排障
 

@@ -122,7 +122,6 @@ class ImageSearchPipeline:
         # 仅在自然语言中约束检索范围，并声明下游只需少量候选（仍可能返回较多，由本地 limit 截断）。
         user_input = (
             "请使用文搜图工具，根据下列检索需求在互联网检索相关图片。\n"
-            "检索需求可为完整自然语言（含角色、作品、风格、用途如壁纸/表情包等），不必压缩为几个词。\n"
             f"检索需求：{query}\n"
             "以语义相关为准，可包含表情包、同人图、截图等。\n"
             "\n"
@@ -136,7 +135,10 @@ class ImageSearchPipeline:
             count,
         )
 
-        image_results = await self._bailian.web_search_images(user_input)
+        image_results = await self._bailian.web_search_images(
+            user_input,
+            early_stop_items=max(5, count),
+        )
         image_results = image_results[:limit]
 
         _log_image_items_stage("bailian_raw", query, image_results)

@@ -176,13 +176,14 @@ class BailianSearchPlugin(MaiBotPlugin):
         description=(
             "联网搜索工具（阿里云百炼 web_search）。当用户有疑问、需要时效信息或不确定的事实时调用，"
             "用简体中文汇总检索结果。"
+            "``question`` 宜为**简短、可直接用于检索**的表述；若名称可能歧义，可从聊天上下文补最少量的作品名或领域。"
             "**注意**：本工具只做文字联网检索。**发图**请改用独立工具 **`bailian_image_agent`**（百炼文搜图智能体），勿用本工具代替。"
         ),
         parameters=[
             ToolParameterInfo(
                 name="question",
                 param_type=ToolParamType.STRING,
-                description="需要检索的问题或主题",
+                description="检索主题或问题：宜短、宜直；必要时据语境补作品名等以消歧。",
                 required=True,
             ),
         ],
@@ -229,25 +230,21 @@ class BailianSearchPlugin(MaiBotPlugin):
             "百炼「文搜图」智能体（百炼 `web_search_image`）：联网按你的描述找图、筛选并**直接发图**给用户，"
             "不是单纯返回一段文字说明。**被调用即会**走完整文搜图链路，无额外确认参数。"
             "适合对话已自然聊到「想看 / 要找 / 发一张和某话题相关的图」——例如角色立绘、壁纸、梗图、配图等。"
-            "用参数 question 写清意图：优先一两句完整自然语言（含角色、作品、风格、用途与尺度边界等），"
-            "避免只堆几个空格隔开的名词。"
+            "``question`` / ``query`` 宜为**简短检索句**：优先用户原话；名称可能歧义时，用最少字数补作品或领域（如「原神 千织 表情包」）。"
             "文搜图链路偏慢，宿主侧单次工具 RPC 默认约 60 秒量级上限；普通闲聊或纯文字问答请不要选用本工具。"
         ),
         parameters=[
             ToolParameterInfo(
                 name="question",
                 param_type=ToolParamType.STRING,
-                description=(
-                    "搜图意图的自然语言描述：可直接沿用用户原话或你理解后的完整表述（不必压缩成关键词），"
-                    "以便保留风格、用途、作品与角色名等语义。"
-                ),
+                description="搜图检索句：宜短；优先用户原话，必要时仅补作品名或游戏名等以消歧。与 ``query`` 至少填其一。",
                 required=False,
                 default="",
             ),
             ToolParameterInfo(
                 name="query",
                 param_type=ToolParamType.STRING,
-                description="兼容旧版调用：图片相关检索短语；若已传 ``question`` 可留空。与 ``question`` 至少填其一。",
+                description="兼容旧版：简短图片检索短语。与 ``question`` 至少填其一。",
                 required=False,
                 default="",
             ),
